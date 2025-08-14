@@ -1,259 +1,253 @@
 import logging
 import time
-import uuid
 from typing import Optional
 
-from open_webui.internal.db import Base
-from open_webui.internal.db_async import get_db
-
-from open_webui.models.chats import Chats  # (unused here, left as-is)
+from open_webui.internal.db import Base, JSONField  # keep Base from sync db
+from open_webui.internal.db_async import get_db     # async session context
 from open_webui.env import SRC_LOG_LEVELS
-
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, Text, JSON
+from sqlalchemy import BigInteger, Column, String, Text, JSON
 from sqlalchemy import select, delete
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
-
 ####################
-# Feedback DB Schema
+# Files DB Schema
 ####################
 
-class Feedback(Base):
-    __tablename__ = "feedback"
-    id = Column(Text, primary_key=True)
-    user_id = Column(Text)
-    version = Column(BigInteger, default=0)
-    type = Column(Text)
+class File(Base):
+    __tablename__ = "file"
+    id = Column(String, primary_key=True)
+    user_id = Column(String)
+    hash = Column(Text, nullable=True)
+
+    filename = Column(Text)
+    path = Column(Text, nullable=True)
+
     data = Column(JSON, nullable=True)
     meta = Column(JSON, nullable=True)
-    snapshot = Column(JSON, nullable=True)
+
+    access_control = Column(JSON, nullable=True)
+
     created_at = Column(BigInteger)
     updated_at = Column(BigInteger)
 
 
-class FeedbackModel(BaseModel):
+class FileModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     user_id: str
-    version: int
-    type: str
+    hash: Optional[str] = None
+
+    filename: str
+    path: Optional[str] = None
+
     data: Optional[dict] = None
     meta: Optional[dict] = None
-    snapshot: Optional[dict] = None
-    created_at: int
-    updated_at: int
 
-    model_config = ConfigDict(from_attributes=True)
+    access_control: Optional[dict] = None
+
+    created_at: Optional[int]  # timestamp in epoch
+    updated_at: Optional[int]  # timestamp in epoch
 
 
 ####################
 # Forms
 ####################
 
-class FeedbackResponse(BaseModel):
+class FileMeta(BaseModel):
+    name: Optional[str] = None
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class FileModelResponse(BaseModel):
     id: str
     user_id: str
-    version: int
-    type: str
+    hash: Optional[str] = None
+
+    filename: str
     data: Optional[dict] = None
-    meta: Optional[dict] = None
-    created_at: int
-    updated_at: int
+    meta: FileMeta
 
+    created_at: int  # timestamp in epoch
+    updated_at: int  # timestamp in epoch
 
-class RatingData(BaseModel):
-    rating: Optional[str | int] = None
-    model_id: Optional[str] = None
-    sibling_model_ids: Optional[list[str]] = None
-    reason: Optional[str] = None
-    comment: Optional[str] = None
-    model_config = ConfigDict(extra="allow", protected_namespaces=())
-
-
-class MetaData(BaseModel):
-    arena: Optional[bool] = None
-    chat_id: Optional[str] = None
-    message_id: Optional[str] = None
-    tags: Optional[list[str]] = None
     model_config = ConfigDict(extra="allow")
 
 
-class SnapshotData(BaseModel):
-    chat: Optional[dict] = None
-    model_config = ConfigDict(extra="allow")
+class FileMetadataResponse(BaseModel):
+    id: str
+    meta: dict
+    created_at: int  # timestamp in epoch
+    updated_at: int  # timestamp in epoch
 
 
-class FeedbackForm(BaseModel):
-    type: str
-    data: Optional[RatingData] = None
-    meta: Optional[dict] = None
-    snapshot: Optional[SnapshotData] = None
-    model_config = ConfigDict(extra="allow")
+class FileForm(BaseModel):
+    id: str
+    hash: Optional[str] = None
+    filename: str
+    path: str
+    data: dict = {}
+    meta: dict = {}
+    access_control: Optional[dict] = None
 
 
-class FeedbackTable:
-    async def insert_new_feedback(
-        self, user_id: str, form_data: FeedbackForm
-    ) -> Optional[FeedbackModel]:
+class FilesTable:
+    async def insert_new_file(self, user_id: str, form_data: FileForm) -> Optional[FileModel]:
         async with get_db() as db:
-            id = str(uuid.uuid4())
-            feedback = FeedbackModel(
+            file = FileModel(
                 **{
-                    "id": id,
-                    "user_id": user_id,
-                    "version": 0,
                     **form_data.model_dump(),
+                    "user_id": user_id,
                     "created_at": int(time.time()),
                     "updated_at": int(time.time()),
                 }
             )
             try:
-                result = Feedback(**feedback.model_dump())
+                result = File(**file.model_dump())
                 db.add(result)
                 await db.commit()
                 await db.refresh(result)
-                return FeedbackModel.model_validate(result) if result else None
+                if result:
+                    return FileModel.model_validate(result)
+                else:
+                    return None
             except Exception as e:
                 await db.rollback()
-                log.exception(f"Error creating a new feedback: {e}")
+                log.exception(f"Error inserting a new file: {e}")
                 return None
 
-    async def get_feedback_by_id(self, id: str) -> Optional[FeedbackModel]:
-        try:
-            async with get_db() as db:
-                row = await db.get(Feedback, id)
-                if not row:
+    async def get_file_by_id(self, id: str) -> Optional[FileModel]:
+        async with get_db() as db:
+            try:
+                file = await db.get(File, id)
+                return FileModel.model_validate(file) if file else None
+            except Exception:
+                return None
+
+    async def get_file_metadata_by_id(self, id: str) -> Optional[FileMetadataResponse]:
+        async with get_db() as db:
+            try:
+                file = await db.get(File, id)
+                if not file:
                     return None
-                return FeedbackModel.model_validate(row)
-        except Exception:
-            return None
+                return FileMetadataResponse(
+                    id=file.id,
+                    meta=file.meta,
+                    created_at=file.created_at,
+                    updated_at=file.updated_at,
+                )
+            except Exception:
+                return None
 
-    async def get_feedback_by_id_and_user_id(
-        self, id: str, user_id: str
-    ) -> Optional[FeedbackModel]:
-        try:
-            async with get_db() as db:
-                row = (
-                    await db.execute(
-                        select(Feedback).where(Feedback.id == id, Feedback.user_id == user_id)
-                    )
-                ).scalar_one_or_none()
-                if not row:
+    async def get_files(self) -> list[FileModel]:
+        async with get_db() as db:
+            rows = (await db.execute(select(File))).scalars().all()
+            return [FileModel.model_validate(file) for file in rows]
+
+    async def get_files_by_ids(self, ids: list[str]) -> list[FileModel]:
+        async with get_db() as db:
+            rows = (
+                await db.execute(
+                    select(File)
+                    .where(File.id.in_(ids))
+                    .order_by(File.updated_at.desc())
+                )
+            ).scalars().all()
+            return [FileModel.model_validate(file) for file in rows]
+
+    async def get_file_metadatas_by_ids(self, ids: list[str]) -> list[FileMetadataResponse]:
+        async with get_db() as db:
+            rows = (
+                await db.execute(
+                    select(File)
+                    .where(File.id.in_(ids))
+                    .order_by(File.updated_at.desc())
+                )
+            ).scalars().all()
+            return [
+                FileMetadataResponse(
+                    id=file.id,
+                    meta=file.meta,
+                    created_at=file.created_at,
+                    updated_at=file.updated_at,
+                )
+                for file in rows
+            ]
+
+    async def get_files_by_user_id(self, user_id: str) -> list[FileModel]:
+        async with get_db() as db:
+            rows = (
+                await db.execute(select(File).where(File.user_id == user_id))
+            ).scalars().all()
+            return [FileModel.model_validate(file) for file in rows]
+
+    async def update_file_hash_by_id(self, id: str, hash: str) -> Optional[FileModel]:
+        async with get_db() as db:
+            try:
+                file = await db.get(File, id)
+                if not file:
                     return None
-                return FeedbackModel.model_validate(row)
-        except Exception:
-            return None
-
-    async def get_all_feedbacks(self) -> list[FeedbackModel]:
-        async with get_db() as db:
-            rows = (
-                await db.execute(select(Feedback).order_by(Feedback.updated_at.desc()))
-            ).scalars().all()
-            return [FeedbackModel.model_validate(r) for r in rows]
-
-    async def get_feedbacks_by_type(self, type: str) -> list[FeedbackModel]:
-        async with get_db() as db:
-            rows = (
-                await db.execute(
-                    select(Feedback)
-                    .where(Feedback.type == type)
-                    .order_by(Feedback.updated_at.desc())
-                )
-            ).scalars().all()
-            return [FeedbackModel.model_validate(r) for r in rows]
-
-    async def get_feedbacks_by_user_id(self, user_id: str) -> list[FeedbackModel]:
-        async with get_db() as db:
-            rows = (
-                await db.execute(
-                    select(Feedback)
-                    .where(Feedback.user_id == user_id)
-                    .order_by(Feedback.updated_at.desc())
-                )
-            ).scalars().all()
-            return [FeedbackModel.model_validate(r) for r in rows]
-
-    async def update_feedback_by_id(
-        self, id: str, form_data: FeedbackForm
-    ) -> Optional[FeedbackModel]:
-        async with get_db() as db:
-            row = await db.get(Feedback, id)
-            if not row:
+                file.hash = hash
+                file.updated_at = int(time.time())
+                await db.commit()
+                await db.refresh(file)
+                return FileModel.model_validate(file)
+            except Exception:
                 return None
 
-            if form_data.data:
-                row.data = form_data.data.model_dump()
-            if form_data.meta:
-                row.meta = form_data.meta
-            if form_data.snapshot:
-                row.snapshot = form_data.snapshot.model_dump()
-
-            row.updated_at = int(time.time())
-
-            await db.commit()
-            await db.refresh(row)
-            return FeedbackModel.model_validate(row)
-
-    async def update_feedback_by_id_and_user_id(
-        self, id: str, user_id: str, form_data: FeedbackForm
-    ) -> Optional[FeedbackModel]:
+    async def update_file_data_by_id(self, id: str, data: dict) -> Optional[FileModel]:
         async with get_db() as db:
-            row = (
-                await db.execute(
-                    select(Feedback).where(Feedback.id == id, Feedback.user_id == user_id)
-                )
-            ).scalar_one_or_none()
-            if not row:
+            try:
+                file = await db.get(File, id)
+                if not file:
+                    return None
+                file.data = {**(file.data or {}), **data}
+                file.updated_at = int(time.time())
+                await db.commit()
+                await db.refresh(file)
+                return FileModel.model_validate(file)
+            except Exception:
                 return None
 
-            if form_data.data:
-                row.data = form_data.data.model_dump()
-            if form_data.meta:
-                row.meta = form_data.meta
-            if form_data.snapshot:
-                row.snapshot = form_data.snapshot.model_dump()
-
-            row.updated_at = int(time.time())
-
-            await db.commit()
-            await db.refresh(row)
-            return FeedbackModel.model_validate(row)
-
-    async def delete_feedback_by_id(self, id: str) -> bool:
+    async def update_file_metadata_by_id(self, id: str, meta: dict) -> Optional[FileModel]:
         async with get_db() as db:
-            row = await db.get(Feedback, id)
-            if not row:
+            try:
+                file = await db.get(File, id)
+                if not file:
+                    return None
+                file.meta = {**(file.meta or {}), **meta}
+                file.updated_at = int(time.time())
+                await db.commit()
+                await db.refresh(file)
+                return FileModel.model_validate(file)
+            except Exception:
+                return None
+
+    async def delete_file_by_id(self, id: str) -> bool:
+        async with get_db() as db:
+            try:
+                # DB-level delete
+                res = await db.execute(delete(File).where(File.id == id))
+                await db.commit()
+                return (res.rowcount or 0) > 0
+            except Exception:
                 return False
-            await db.delete(row)
-            await db.commit()
-            return True
 
-    async def delete_feedback_by_id_and_user_id(self, id: str, user_id: str) -> bool:
+    async def delete_all_files(self) -> bool:
         async with get_db() as db:
-            row = (
-                await db.execute(
-                    select(Feedback).where(Feedback.id == id, Feedback.user_id == user_id)
-                )
-            ).scalar_one_or_none()
-            if not row:
+            try:
+                # Unconditional wipe (schema remains)
+                res = await db.execute(delete(File))
+                await db.commit()
+                return (res.rowcount or 0) > 0
+            except Exception:
                 return False
-            await db.delete(row)
-            await db.commit()
-            return True
-
-    async def delete_feedbacks_by_user_id(self, user_id: str) -> bool:
-        async with get_db() as db:
-            res = await db.execute(delete(Feedback).where(Feedback.user_id == user_id))
-            await db.commit()
-            return (res.rowcount or 0) > 0
-
-    async def delete_all_feedbacks(self) -> bool:
-        async with get_db() as db:
-            res = await db.execute(delete(Feedback))
-            await db.commit()
-            return (res.rowcount or 0) > 0
 
 
-Feedbacks = FeedbackTable()
+Files = FilesTable()
