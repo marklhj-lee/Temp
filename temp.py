@@ -1,26 +1,31 @@
+import json
 import logging
 import time
 from typing import Optional
 import uuid
 
-from open_webui.internal.db import Base
-from open_webui.internal.db_async import get_db
+from open_webui.internal.db import Base  # keep Base from sync module
+from open_webui.internal.async_db import get_db  # async session
 from open_webui.env import SRC_LOG_LEVELS
 
+from open_webui.models.files import FileMetadataResponse
+from open_webui.models.users import Users, UserResponse
+
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON, func
+from sqlalchemy import BigInteger, Column, String, Text, JSON
 from sqlalchemy import select, update, delete
+
+from open_webui.utils.access_control import has_access
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
 ####################
-# UserGroup DB Schema
+# Knowledge DB Schema
 ####################
 
-
-class Group(Base):
-    __tablename__ = "group"
+class Knowledge(Base):
+    __tablename__ = "knowledge"
 
     id = Column(Text, unique=True, primary_key=True)
     user_id = Column(Text)
@@ -31,15 +36,15 @@ class Group(Base):
     data = Column(JSON, nullable=True)
     meta = Column(JSON, nullable=True)
 
-    permissions = Column(JSON, nullable=True)
-    user_ids = Column(JSON, nullable=True)
+    access_control = Column(JSON, nullable=True)
 
     created_at = Column(BigInteger)
     updated_at = Column(BigInteger)
 
 
-class GroupModel(BaseModel):
+class KnowledgeModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
     id: str
     user_id: str
 
@@ -49,49 +54,42 @@ class GroupModel(BaseModel):
     data: Optional[dict] = None
     meta: Optional[dict] = None
 
-    permissions: Optional[dict] = None
-    user_ids: list[str] = []
+    access_control: Optional[dict] = None
 
     created_at: int  # timestamp in epoch
     updated_at: int  # timestamp in epoch
-
 
 ####################
 # Forms
 ####################
 
+class KnowledgeUserModel(KnowledgeModel):
+    user: Optional[UserResponse] = None
 
-class GroupResponse(BaseModel):
-    id: str
-    user_id: str
+
+class KnowledgeResponse(KnowledgeModel):
+    files: Optional[list[FileMetadataResponse | dict]] = None
+
+
+class KnowledgeUserResponse(KnowledgeUserModel):
+    files: Optional[list[FileMetadataResponse | dict]] = None
+
+
+class KnowledgeForm(BaseModel):
     name: str
     description: str
-    permissions: Optional[dict] = None
     data: Optional[dict] = None
-    meta: Optional[dict] = None
-    user_ids: list[str] = []
-    created_at: int  # timestamp in epoch
-    updated_at: int  # timestamp in epoch
+    access_control: Optional[dict] = None
 
 
-class GroupForm(BaseModel):
-    name: str
-    description: str
-    permissions: Optional[dict] = None
-
-
-class GroupUpdateForm(GroupForm):
-    user_ids: Optional[list[str]] = None
-
-
-class GroupTable:
-    async def insert_new_group(
-        self, user_id: str, form_data: GroupForm
-    ) -> Optional[GroupModel]:
+class KnowledgeTable:
+    async def insert_new_knowledge(
+        self, user_id: str, form_data: KnowledgeForm
+    ) -> Optional[KnowledgeModel]:
         async with get_db() as db:
-            group = GroupModel(
+            knowledge = KnowledgeModel(
                 **{
-                    **form_data.model_dump(exclude_none=True),
+                    **form_data.model_dump(),
                     "id": str(uuid.uuid4()),
                     "user_id": user_id,
                     "created_at": int(time.time()),
@@ -99,108 +97,111 @@ class GroupTable:
                 }
             )
             try:
-                result = Group(**group.model_dump())
+                result = Knowledge(**knowledge.model_dump())
                 db.add(result)
                 await db.commit()
                 await db.refresh(result)
-                return GroupModel.model_validate(result) if result else None
+                return KnowledgeModel.model_validate(result) if result else None
             except Exception:
                 return None
 
-    async def get_groups(self) -> list[GroupModel]:
+    async def get_knowledge_bases(self) -> list[KnowledgeUserModel]:
         async with get_db() as db:
             rows = (
                 await db.execute(
-                    select(Group).order_by(Group.updated_at.desc())
+                    select(Knowledge).order_by(Knowledge.updated_at.desc())
                 )
             ).scalars().all()
-            return [GroupModel.model_validate(group) for group in rows]
 
-    async def get_groups_by_member_id(self, user_id: str) -> list[GroupModel]:
-        async with get_db() as db:
-            rows = (
-                await db.execute(
-                    select(Group)
-                    .where(func.json_array_length(Group.user_ids) > 0)
-                    .where(Group.user_ids.cast(String).like(f'%"{user_id}"%'))
-                    .order_by(Group.updated_at.desc())
+            knowledge_bases: list[KnowledgeUserModel] = []
+            for knowledge in rows:
+                # Users.* is still sync in your codebase; keep as-is for now
+                user = Users.get_user_by_id(knowledge.user_id)
+                knowledge_bases.append(
+                    KnowledgeUserModel.model_validate(
+                        {
+                            **KnowledgeModel.model_validate(knowledge).model_dump(),
+                            "user": user.model_dump() if user else None,
+                        }
+                    )
                 )
-            ).scalars().all()
-            return [GroupModel.model_validate(group) for group in rows]
+            return knowledge_bases
 
-    async def get_group_by_id(self, id: str) -> Optional[GroupModel]:
+    async def get_knowledge_bases_by_user_id(
+        self, user_id: str, permission: str = "write"
+    ) -> list[KnowledgeUserModel]:
+        bases = await self.get_knowledge_bases()
+        return [
+            kb
+            for kb in bases
+            if kb.user_id == user_id or has_access(user_id, permission, kb.access_control)
+        ]
+
+    async def get_knowledge_by_id(self, id: str) -> Optional[KnowledgeModel]:
         try:
             async with get_db() as db:
-                group = await db.get(Group, id)
-                return GroupModel.model_validate(group) if group else None
+                knowledge = await db.get(Knowledge, id)
+                return KnowledgeModel.model_validate(knowledge) if knowledge else None
         except Exception:
             return None
 
-    async def get_group_user_ids_by_id(self, id: str) -> Optional[list[str]]:
-        group = await self.get_group_by_id(id)
-        if group:
-            return group.user_ids
-        else:
-            return None
-
-    async def update_group_by_id(
-        self, id: str, form_data: GroupUpdateForm, overwrite: bool = False
-    ) -> Optional[GroupModel]:
+    async def update_knowledge_by_id(
+        self, id: str, form_data: KnowledgeForm, overwrite: bool = False
+    ) -> Optional[KnowledgeModel]:
         try:
             async with get_db() as db:
-                res = await db.execute(
-                    update(Group)
-                    .where(Group.id == id)
+                await db.execute(
+                    update(Knowledge)
+                    .where(Knowledge.id == id)
                     .values(
-                        **form_data.model_dump(exclude_none=True),
+                        **form_data.model_dump(),
                         updated_at=int(time.time()),
                     )
                     .execution_options(synchronize_session=False)
                 )
                 await db.commit()
-                if (res.rowcount or 0) == 0:
-                    return None
-                return await self.get_group_by_id(id=id)
+                return await self.get_knowledge_by_id(id=id)
         except Exception as e:
             log.exception(e)
             return None
 
-    async def delete_group_by_id(self, id: str) -> bool:
+    async def update_knowledge_data_by_id(
+        self, id: str, data: dict
+    ) -> Optional[KnowledgeModel]:
         try:
             async with get_db() as db:
-                res = await db.execute(delete(Group).where(Group.id == id))
+                await db.execute(
+                    update(Knowledge)
+                    .where(Knowledge.id == id)
+                    .values(
+                        data=data,
+                        updated_at=int(time.time()),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await db.commit()
+                return await self.get_knowledge_by_id(id=id)
+        except Exception as e:
+            log.exception(e)
+            return None
+
+    async def delete_knowledge_by_id(self, id: str) -> bool:
+        try:
+            async with get_db() as db:
+                res = await db.execute(delete(Knowledge).where(Knowledge.id == id))
                 await db.commit()
                 return (res.rowcount or 0) > 0
         except Exception:
             return False
 
-    async def delete_all_groups(self) -> bool:
+    async def delete_all_knowledge(self) -> bool:
         async with get_db() as db:
             try:
-                await db.execute(delete(Group))
-                await db.commit()
-                return True
-            except Exception:
-                return False
-
-    async def remove_user_from_all_groups(self, user_id: str) -> bool:
-        async with get_db() as db:
-            try:
-                groups = await self.get_groups_by_member_id(user_id)
-
-                for group in groups:
-                    new_user_ids = [uid for uid in (group.user_ids or []) if uid != user_id]
-                    await db.execute(
-                        update(Group)
-                        .where(Group.id == group.id)
-                        .values(user_ids=new_user_ids, updated_at=int(time.time()))
-                        .execution_options(synchronize_session=False)
-                    )
-
+                await db.execute(delete(Knowledge))
                 await db.commit()
                 return True
             except Exception:
                 return False
 
 
-Groups = GroupTable()
+Knowledges = KnowledgeTable()
