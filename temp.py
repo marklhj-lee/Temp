@@ -1,276 +1,238 @@
-import json
+import logging
 import time
-import uuid
 from typing import Optional
 
-from open_webui.internal.db import Base
-from open_webui.internal.db_async import get_db
+from open_webui.internal.db import Base, JSONField  # keep Base/JSONField
+from open_webui.internal.db_async import get_db     # <-- use your async session getter
+from open_webui.env import SRC_LOG_LEVELS
+
+from open_webui.models.users import Users, UserResponse
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Boolean, Column, String, Text, JSON
-from sqlalchemy import select, delete
+
+from sqlalchemy import BigInteger, Column, Text, JSON, Boolean, select, delete
+from sqlalchemy import and_
+
+from open_webui.utils.access_control import has_access
+
+log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["MODELS"])
+
 
 ####################
-# Message DB Schema
+# Models DB Schema (unchanged)
 ####################
 
+class ModelParams(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    pass
 
-class MessageReaction(Base):
-    __tablename__ = "message_reaction"
+
+class ModelMeta(BaseModel):
+    profile_image_url: Optional[str] = "/static/favicon.png"
+    description: Optional[str] = None
+    """
+        User-facing description of the model.
+    """
+    capabilities: Optional[dict] = None
+    model_config = ConfigDict(extra="allow")
+    pass
+
+
+class Model(Base):
+    __tablename__ = "model"
+
     id = Column(Text, primary_key=True)
     user_id = Column(Text)
-    message_id = Column(Text)
+
+    base_model_id = Column(Text, nullable=True)
+    """
+        An optional pointer to the actual model that should be used when proxying requests.
+    """
+
     name = Column(Text)
+    """
+        The human-readable display name of the model.
+    """
+
+    params = Column(JSONField)
+    """
+        Holds a JSON encoded blob of parameters, see `ModelParams`.
+    """
+
+    meta = Column(JSONField)
+    """
+        Holds a JSON encoded blob of metadata, see `ModelMeta`.
+    """
+
+    access_control = Column(JSON, nullable=True)  # Controls data access levels.
+
+    is_active = Column(Boolean, default=True)
+
+    updated_at = Column(BigInteger)
     created_at = Column(BigInteger)
 
 
-class MessageReactionModel(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class ModelModel(BaseModel):
     id: str
     user_id: str
-    message_id: str
+    base_model_id: Optional[str] = None
     name: str
-    created_at: int  # timestamp in epoch
-
-
-class Message(Base):
-    __tablename__ = "message"
-    id = Column(Text, primary_key=True)
-
-    user_id = Column(Text)
-    channel_id = Column(Text, nullable=True)
-
-    parent_id = Column(Text, nullable=True)
-
-    content = Column(Text)
-    data = Column(JSON, nullable=True)
-    meta = Column(JSON, nullable=True)
-
-    created_at = Column(BigInteger)  # time_ns
-    updated_at = Column(BigInteger)  # time_ns
-
-
-class MessageModel(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: str
-    user_id: str
-    channel_id: Optional[str] = None
-
-    parent_id: Optional[str] = None
-
-    content: str
-    data: Optional[dict] = None
-    meta: Optional[dict] = None
-
-    created_at: int  # timestamp in epoch
+    params: ModelParams
+    meta: ModelMeta
+    access_control: Optional[dict] = None
+    is_active: bool
     updated_at: int  # timestamp in epoch
+    created_at: int  # timestamp in epoch
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 ####################
-# Forms
+# Forms (unchanged)
 ####################
 
-
-class MessageForm(BaseModel):
-    content: str
-    parent_id: Optional[str] = None
-    data: Optional[dict] = None
-    meta: Optional[dict] = None
+class ModelUserResponse(ModelModel):
+    user: Optional[UserResponse] = None
 
 
-class Reactions(BaseModel):
+class ModelResponse(ModelModel):
+    pass
+
+
+class ModelForm(BaseModel):
+    id: str
+    base_model_id: Optional[str] = None
     name: str
-    user_ids: list[str]
-    count: int
+    meta: ModelMeta
+    params: ModelParams
+    access_control: Optional[dict] = None
+    is_active: bool = True
 
 
-class MessageResponse(MessageModel):
-    latest_reply_at: Optional[int]
-    reply_count: int
-    reactions: list[Reactions]
-
-
-class MessageTable:
-    async def insert_new_message(
-        self, form_data: MessageForm, channel_id: str, user_id: str
-    ) -> Optional[MessageModel]:
-        async with get_db() as db:
-            id = str(uuid.uuid4())
-            ts = int(time.time_ns())
-
-            message = MessageModel(
-                **{
-                    "id": id,
-                    "user_id": user_id,
-                    "channel_id": channel_id,
-                    "parent_id": form_data.parent_id,
-                    "content": form_data.content,
-                    "data": form_data.data,
-                    "meta": form_data.meta,
-                    "created_at": ts,
-                    "updated_at": ts,
-                }
-            )
-
-            result = Message(**message.model_dump())
-            db.add(result)
-            await db.commit()
-            await db.refresh(result)
-            return MessageModel.model_validate(result) if result else None
-
-    async def get_message_by_id(self, id: str) -> Optional[MessageResponse]:
-        async with get_db() as db:
-            message = await db.get(Message, id)
-            if not message:
-                return None
-
-        reactions = await self.get_reactions_by_message_id(id)
-        replies = await self.get_replies_by_message_id(id)
-
-        return MessageResponse(
+class ModelsTable:
+    async def insert_new_model(
+        self, form_data: ModelForm, user_id: str
+    ) -> Optional[ModelModel]:
+        model = ModelModel(
             **{
-                **MessageModel.model_validate(message).model_dump(),
-                "latest_reply_at": replies[0].created_at if replies else None,
-                "reply_count": len(replies),
-                "reactions": reactions,
+                **form_data.model_dump(),
+                "user_id": user_id,
+                "created_at": int(time.time()),
+                "updated_at": int(time.time()),
             }
         )
+        try:
+            async with get_db() as db:
+                row = Model(**model.model_dump())
+                db.add(row)
+                await db.commit()
+                await db.refresh(row)
+                return ModelModel.model_validate(row) if row else None
+        except Exception as e:
+            log.exception(f"Failed to insert a new model: {e}")
+            return None
 
-    async def get_replies_by_message_id(self, id: str) -> list[MessageModel]:
+    async def get_all_models(self) -> list[ModelModel]:
         async with get_db() as db:
-            res = await db.execute(
-                select(Message)
-                .filter_by(parent_id=id)
-                .order_by(Message.created_at.desc())
-            )
-            all_messages = res.scalars().all()
-            return [MessageModel.model_validate(m) for m in all_messages]
+            res = await db.execute(select(Model))
+            return [ModelModel.model_validate(m) for m in res.scalars().all()]
 
-    async def get_reply_user_ids_by_message_id(self, id: str) -> list[str]:
+    async def get_models(self) -> list[ModelUserResponse]:
         async with get_db() as db:
-            res = await db.execute(select(Message).filter_by(parent_id=id))
-            return [m.user_id for m in res.scalars().all()]
+            # base_model_id != None -> use .is_not(None) in SQLAlchemy
+            res = await db.execute(select(Model).where(Model.base_model_id.is_not(None)))
+            rows = res.scalars().all()
 
-    async def get_messages_by_channel_id(
-        self, channel_id: str, skip: int = 0, limit: int = 50
-    ) -> list[MessageModel]:
-        async with get_db() as db:
-            res = await db.execute(
-                select(Message)
-                .filter_by(channel_id=channel_id, parent_id=None)
-                .order_by(Message.created_at.desc())
-                .offset(skip)
-                .limit(limit)
-            )
-            all_messages = res.scalars().all()
-            return [MessageModel.model_validate(m) for m in all_messages]
-
-    async def get_messages_by_parent_id(
-        self, channel_id: str, parent_id: str, skip: int = 0, limit: int = 50
-    ) -> list[MessageModel]:
-        async with get_db() as db:
-            parent = await db.get(Message, parent_id)
-            if not parent:
-                return []
-
-            res = await db.execute(
-                select(Message)
-                .filter_by(channel_id=channel_id, parent_id=parent_id)
-                .order_by(Message.created_at.desc())
-                .offset(skip)
-                .limit(limit)
-            )
-            all_messages = res.scalars().all()
-
-        # If length of all_messages is less than limit, then add the parent message
-        if len(all_messages) < limit:
-            all_messages.append(parent)
-
-        return [MessageModel.model_validate(m) for m in all_messages]
-
-    async def update_message_by_id(
-        self, id: str, form_data: MessageForm
-    ) -> Optional[MessageModel]:
-        async with get_db() as db:
-            message = await db.get(Message, id)
-            if not message:
-                return None
-            message.content = form_data.content
-            message.data = form_data.data
-            message.meta = form_data.meta
-            message.updated_at = int(time.time_ns())
-            await db.commit()
-            await db.refresh(message)
-            return MessageModel.model_validate(message)
-
-    async def add_reaction_to_message(
-        self, id: str, user_id: str, name: str
-    ) -> Optional[MessageReactionModel]:
-        async with get_db() as db:
-            reaction_id = str(uuid.uuid4())
-            reaction = MessageReactionModel(
-                id=reaction_id,
-                user_id=user_id,
-                message_id=id,
-                name=name,
-                created_at=int(time.time_ns()),
-            )
-            result = MessageReaction(**reaction.model_dump())
-            db.add(result)
-            await db.commit()
-            await db.refresh(result)
-            return MessageReactionModel.model_validate(result) if result else None
-
-    async def get_reactions_by_message_id(self, id: str) -> list[Reactions]:
-        async with get_db() as db:
-            res = await db.execute(select(MessageReaction).filter_by(message_id=id))
-            all_reactions = res.scalars().all()
-
-        reactions_map: dict[str, dict] = {}
-        for r in all_reactions:
-            if r.name not in reactions_map:
-                reactions_map[r.name] = {"name": r.name, "user_ids": [], "count": 0}
-            reactions_map[r.name]["user_ids"].append(r.user_id)
-            reactions_map[r.name]["count"] += 1
-
-        return [Reactions(**r) for r in reactions_map.values()]
-
-    async def remove_reaction_by_id_and_user_id_and_name(
-        self, id: str, user_id: str, name: str
-    ) -> bool:
-        async with get_db() as db:
-            await db.execute(
-                delete(MessageReaction).where(
-                    MessageReaction.message_id == id,
-                    MessageReaction.user_id == user_id,
-                    MessageReaction.name == name,
+        models: list[ModelUserResponse] = []
+        for m in rows:
+            # If Users.get_user_by_id has an async version, switch to: user = await Users.get_user_by_id(m.user_id)
+            user = Users.get_user_by_id(m.user_id)
+            models.append(
+                ModelUserResponse.model_validate(
+                    {
+                        **ModelModel.model_validate(m).model_dump(),
+                        "user": user.model_dump() if user else None,
+                    }
                 )
             )
-            await db.commit()
-            return True
+        return models
 
-    async def delete_reactions_by_id(self, id: str) -> bool:
+    async def get_base_models(self) -> list[ModelModel]:
         async with get_db() as db:
-            await db.execute(delete(MessageReaction).where(MessageReaction.message_id == id))
-            await db.commit()
-            return True
+            res = await db.execute(select(Model).where(Model.base_model_id.is_(None)))
+            return [ModelModel.model_validate(m) for m in res.scalars().all()]
 
-    async def delete_replies_by_id(self, id: str) -> bool:
+    async def get_models_by_user_id(
+        self, user_id: str, permission: str = "write"
+    ) -> list[ModelUserResponse]:
+        models = await self.get_models()
+        return [
+            model
+            for model in models
+            if model.user_id == user_id
+            or has_access(user_id, permission, model.access_control)
+        ]
+
+    async def get_model_by_id(self, id: str) -> Optional[ModelModel]:
+        try:
+            async with get_db() as db:
+                row = await db.get(Model, id)
+                return ModelModel.model_validate(row) if row else None
+        except Exception:
+            return None
+
+    async def toggle_model_by_id(self, id: str) -> Optional[ModelModel]:
         async with get_db() as db:
-            await db.execute(delete(Message).where(Message.parent_id == id))
-            await db.commit()
-            return True
+            try:
+                row = await db.get(Model, id)
+                if not row:
+                    return None
+                row.is_active = not bool(row.is_active)
+                row.updated_at = int(time.time())
+                await db.commit()
+                await db.refresh(row)
+                return ModelModel.model_validate(row)
+            except Exception:
+                return None
 
-    async def delete_message_by_id(self, id: str) -> bool:
-        async with get_db() as db:
-            # Delete the message
-            await db.execute(delete(Message).where(Message.id == id))
-            # Delete all reactions to this message
-            await db.execute(delete(MessageReaction).where(MessageReaction.message_id == id))
-            await db.commit()
-            return True
+    async def update_model_by_id(self, id: str, model: ModelForm) -> Optional[ModelModel]:
+        try:
+            async with get_db() as db:
+                row = await db.get(Model, id)
+                if not row:
+                    return None
+
+                # update only fields present in form (excluding id)
+                data = model.model_dump(exclude={"id"})
+                for k, v in data.items():
+                    setattr(row, k, v)
+                row.updated_at = int(time.time())
+
+                await db.commit()
+                await db.refresh(row)
+                return ModelModel.model_validate(row)
+        except Exception as e:
+            log.exception(f"Failed to update the model by id {id}: {e}")
+            return None
+
+    async def delete_model_by_id(self, id: str) -> bool:
+        try:
+            async with get_db() as db:
+                await db.execute(delete(Model).where(Model.id == id))
+                await db.commit()
+                return True
+        except Exception:
+            return False
+
+    async def delete_all_models(self) -> bool:
+        try:
+            async with get_db() as db:
+                await db.execute(delete(Model))
+                await db.commit()
+                return True
+        except Exception:
+            return False
 
 
-Messages = MessageTable()
+Models = ModelsTable()
