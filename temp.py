@@ -1,207 +1,118 @@
-import json
-import logging
 import time
-from typing import Optional
 import uuid
+from typing import Optional
 
-from open_webui.internal.db import Base  # keep Base from sync module
-from open_webui.internal.async_db import get_db  # async session
-from open_webui.env import SRC_LOG_LEVELS
-
-from open_webui.models.files import FileMetadataResponse
-from open_webui.models.users import Users, UserResponse
-
+from open_webui.internal.db import Base  # unchanged
+from open_webui.internal.async_db import get_db  # ⬅️ use the async session
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON
-from sqlalchemy import select, update, delete
-
-from open_webui.utils.access_control import has_access
-
-log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["MODELS"])
+from sqlalchemy import BigInteger, Column, String, Text
+from sqlalchemy import select, update, delete  # ⬅️ async-friendly Core APIs
 
 ####################
-# Knowledge DB Schema
+# Memory DB Schema
 ####################
 
-class Knowledge(Base):
-    __tablename__ = "knowledge"
+class Memory(Base):
+    __tablename__ = "memory"
 
-    id = Column(Text, unique=True, primary_key=True)
-    user_id = Column(Text)
-
-    name = Column(Text)
-    description = Column(Text)
-
-    data = Column(JSON, nullable=True)
-    meta = Column(JSON, nullable=True)
-
-    access_control = Column(JSON, nullable=True)
-
-    created_at = Column(BigInteger)
+    id = Column(String, primary_key=True)
+    user_id = Column(String)
+    content = Column(Text)
     updated_at = Column(BigInteger)
+    created_at = Column(BigInteger)
 
 
-class KnowledgeModel(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class MemoryModel(BaseModel):
     id: str
     user_id: str
-
-    name: str
-    description: str
-
-    data: Optional[dict] = None
-    meta: Optional[dict] = None
-
-    access_control: Optional[dict] = None
-
-    created_at: int  # timestamp in epoch
+    content: str
     updated_at: int  # timestamp in epoch
+    created_at: int  # timestamp in epoch
+
+    model_config = ConfigDict(from_attributes=True)
+
 
 ####################
-# Forms
+# Table
 ####################
 
-class KnowledgeUserModel(KnowledgeModel):
-    user: Optional[UserResponse] = None
-
-
-class KnowledgeResponse(KnowledgeModel):
-    files: Optional[list[FileMetadataResponse | dict]] = None
-
-
-class KnowledgeUserResponse(KnowledgeUserModel):
-    files: Optional[list[FileMetadataResponse | dict]] = None
-
-
-class KnowledgeForm(BaseModel):
-    name: str
-    description: str
-    data: Optional[dict] = None
-    access_control: Optional[dict] = None
-
-
-class KnowledgeTable:
-    async def insert_new_knowledge(
-        self, user_id: str, form_data: KnowledgeForm
-    ) -> Optional[KnowledgeModel]:
+class MemoriesTable:
+    async def insert_new_memory(
+        self,
+        user_id: str,
+        content: str,
+    ) -> Optional[MemoryModel]:
         async with get_db() as db:
-            knowledge = KnowledgeModel(
-                **{
-                    **form_data.model_dump(),
-                    "id": str(uuid.uuid4()),
-                    "user_id": user_id,
-                    "created_at": int(time.time()),
-                    "updated_at": int(time.time()),
-                }
-            )
-            try:
-                result = Knowledge(**knowledge.model_dump())
-                db.add(result)
-                await db.commit()
-                await db.refresh(result)
-                return KnowledgeModel.model_validate(result) if result else None
-            except Exception:
-                return None
+            id_ = str(uuid.uuid4())
+            now = int(time.time())
 
-    async def get_knowledge_bases(self) -> list[KnowledgeUserModel]:
+            memory = Memory(
+                id=id_,
+                user_id=user_id,
+                content=content,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(memory)
+            await db.commit()
+            await db.refresh(memory)
+            return MemoryModel.model_validate(memory) if memory else None
+
+    async def update_memory_by_id_and_user_id(
+        self,
+        id: str,
+        user_id: str,
+        content: str,
+    ) -> Optional[MemoryModel]:
+        async with get_db() as db:
+            res = await db.execute(
+                update(Memory)
+                .where(Memory.id == id, Memory.user_id == user_id)
+                .values(content=content, updated_at=int(time.time()))
+                .execution_options(synchronize_session=False)
+            )
+            await db.commit()
+            if (res.rowcount or 0) == 0:
+                return None
+            mem = await db.get(Memory, id)
+            return MemoryModel.model_validate(mem) if mem else None
+
+    async def get_memories(self) -> Optional[list[MemoryModel]]:
+        async with get_db() as db:
+            rows = (await db.execute(select(Memory))).scalars().all()
+            return [MemoryModel.model_validate(m) for m in rows]
+
+    async def get_memories_by_user_id(self, user_id: str) -> Optional[list[MemoryModel]]:
         async with get_db() as db:
             rows = (
-                await db.execute(
-                    select(Knowledge).order_by(Knowledge.updated_at.desc())
-                )
+                await db.execute(select(Memory).where(Memory.user_id == user_id))
             ).scalars().all()
+            return [MemoryModel.model_validate(m) for m in rows]
 
-            knowledge_bases: list[KnowledgeUserModel] = []
-            for knowledge in rows:
-                # Users.* is still sync in your codebase; keep as-is for now
-                user = Users.get_user_by_id(knowledge.user_id)
-                knowledge_bases.append(
-                    KnowledgeUserModel.model_validate(
-                        {
-                            **KnowledgeModel.model_validate(knowledge).model_dump(),
-                            "user": user.model_dump() if user else None,
-                        }
-                    )
-                )
-            return knowledge_bases
-
-    async def get_knowledge_bases_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[KnowledgeUserModel]:
-        bases = await self.get_knowledge_bases()
-        return [
-            kb
-            for kb in bases
-            if kb.user_id == user_id or has_access(user_id, permission, kb.access_control)
-        ]
-
-    async def get_knowledge_by_id(self, id: str) -> Optional[KnowledgeModel]:
-        try:
-            async with get_db() as db:
-                knowledge = await db.get(Knowledge, id)
-                return KnowledgeModel.model_validate(knowledge) if knowledge else None
-        except Exception:
-            return None
-
-    async def update_knowledge_by_id(
-        self, id: str, form_data: KnowledgeForm, overwrite: bool = False
-    ) -> Optional[KnowledgeModel]:
-        try:
-            async with get_db() as db:
-                await db.execute(
-                    update(Knowledge)
-                    .where(Knowledge.id == id)
-                    .values(
-                        **form_data.model_dump(),
-                        updated_at=int(time.time()),
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-                await db.commit()
-                return await self.get_knowledge_by_id(id=id)
-        except Exception as e:
-            log.exception(e)
-            return None
-
-    async def update_knowledge_data_by_id(
-        self, id: str, data: dict
-    ) -> Optional[KnowledgeModel]:
-        try:
-            async with get_db() as db:
-                await db.execute(
-                    update(Knowledge)
-                    .where(Knowledge.id == id)
-                    .values(
-                        data=data,
-                        updated_at=int(time.time()),
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-                await db.commit()
-                return await self.get_knowledge_by_id(id=id)
-        except Exception as e:
-            log.exception(e)
-            return None
-
-    async def delete_knowledge_by_id(self, id: str) -> bool:
-        try:
-            async with get_db() as db:
-                res = await db.execute(delete(Knowledge).where(Knowledge.id == id))
-                await db.commit()
-                return (res.rowcount or 0) > 0
-        except Exception:
-            return False
-
-    async def delete_all_knowledge(self) -> bool:
+    async def get_memory_by_id(self, id: str) -> Optional[MemoryModel]:
         async with get_db() as db:
-            try:
-                await db.execute(delete(Knowledge))
-                await db.commit()
-                return True
-            except Exception:
-                return False
+            mem = await db.get(Memory, id)
+            return MemoryModel.model_validate(mem) if mem else None
+
+    async def delete_memory_by_id(self, id: str) -> bool:
+        async with get_db() as db:
+            res = await db.execute(delete(Memory).where(Memory.id == id))
+            await db.commit()
+            return (res.rowcount or 0) > 0
+
+    async def delete_memories_by_user_id(self, user_id: str) -> bool:
+        async with get_db() as db:
+            res = await db.execute(delete(Memory).where(Memory.user_id == user_id))
+            await db.commit()
+            return (res.rowcount or 0) > 0
+
+    async def delete_memory_by_id_and_user_id(self, id: str, user_id: str) -> bool:
+        async with get_db() as db:
+            res = await db.execute(
+                delete(Memory).where(Memory.id == id, Memory.user_id == user_id)
+            )
+            await db.commit()
+            return (res.rowcount or 0) > 0
 
 
-Knowledges = KnowledgeTable()
+Memories = MemoriesTable()
