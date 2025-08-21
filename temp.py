@@ -8,7 +8,7 @@ from open_webui.models.chats import Chats
 from open_webui.models.groups import Groups
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, select, delete
+from sqlalchemy import BigInteger, Column, String, Text, select, delete, select, func, or_
 
 
 ####################
