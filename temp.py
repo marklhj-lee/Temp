@@ -1,145 +1,103 @@
+import logging
 import time
+import uuid
 from typing import Optional
 
-from open_webui.internal.db import Base
+from open_webui.internal.db import Base  # keep Base as-is
 from open_webui.internal.db_async import get_db  # ← async session
-from open_webui.models.users import Users, UserResponse
 
+from open_webui.env import SRC_LOG_LEVELS
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON, select, delete
+from sqlalchemy import BigInteger, Column, String, JSON, PrimaryKeyConstraint, select, delete
 
-from open_webui.utils.access_control import has_access
+log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
 
 ####################
-# Prompts DB Schema
+# Tag DB Schema (unchanged)
 ####################
-
-class Prompt(Base):
-    __tablename__ = "prompt"
-
-    command = Column(String, primary_key=True)
+class Tag(Base):
+    __tablename__ = "tag"
+    id = Column(String)
+    name = Column(String)
     user_id = Column(String)
-    title = Column(Text)
-    content = Column(Text)
-    timestamp = Column(BigInteger)
+    meta = Column(JSON, nullable=True)
 
-    access_control = Column(JSON, nullable=True)  # Controls data access levels.
+    # Unique constraint ensuring (id, user_id) is unique, not just the `id` column
+    __table_args__ = (PrimaryKeyConstraint("id", "user_id", name="pk_id_user_id"),)
 
 
-class PromptModel(BaseModel):
-    command: str
+class TagModel(BaseModel):
+    id: str
+    name: str
     user_id: str
-    title: str
-    content: str
-    timestamp: int  # timestamp in epoch
-
-    access_control: Optional[dict] = None
+    meta: Optional[dict] = None
     model_config = ConfigDict(from_attributes=True)
 
 
 ####################
-# Forms
+# Forms (unchanged)
 ####################
 
-class PromptUserResponse(PromptModel):
-    user: Optional[UserResponse] = None
+class TagChatIdForm(BaseModel):
+    name: str
+    chat_id: str
 
 
-class PromptForm(BaseModel):
-    command: str
-    title: str
-    content: str
-    access_control: Optional[dict] = None
-
-
-class PromptsTable:
-    async def insert_new_prompt(
-        self, user_id: str, form_data: PromptForm
-    ) -> Optional[PromptModel]:
-        prompt = PromptModel(
-            **{
-                "user_id": user_id,
-                **form_data.model_dump(),
-                "timestamp": int(time.time()),
-            }
-        )
-
-        try:
-            async with get_db() as db:
-                row = Prompt(**prompt.model_dump())
+class TagTable:
+    async def insert_new_tag(self, name: str, user_id: str) -> Optional[TagModel]:
+        async with get_db() as db:
+            id = name.replace(" ", "_").lower()
+            tag = TagModel(**{"id": id, "user_id": user_id, "name": name})
+            try:
+                row = Tag(**tag.model_dump())
                 db.add(row)
                 await db.commit()
                 await db.refresh(row)
-                return PromptModel.model_validate(row) if row else None
-        except Exception:
-            return None
+                return TagModel.model_validate(row) if row else None
+            except Exception as e:
+                log.exception(f"Error inserting a new tag: {e}")
+                return None
 
-    async def get_prompt_by_command(self, command: str) -> Optional[PromptModel]:
+    async def get_tag_by_name_and_user_id(
+        self, name: str, user_id: str
+    ) -> Optional[TagModel]:
         try:
+            id = name.replace(" ", "_").lower()
             async with get_db() as db:
-                res = await db.execute(select(Prompt).filter_by(command=command))
+                res = await db.execute(select(Tag).filter_by(id=id, user_id=user_id))
                 row = res.scalars().first()
-                return PromptModel.model_validate(row) if row else None
+                return TagModel.model_validate(row) if row else None
         except Exception:
             return None
 
-    async def get_prompts(self) -> list[PromptUserResponse]:
+    async def get_tags_by_user_id(self, user_id: str) -> list[TagModel]:
         async with get_db() as db:
-            res = await db.execute(select(Prompt).order_by(Prompt.timestamp.desc()))
+            res = await db.execute(select(Tag).filter_by(user_id=user_id))
             rows = res.scalars().all()
+            return [TagModel.model_validate(t) for t in rows]
 
-            prompts: list[PromptUserResponse] = []
-            for p in rows:
-                user = await Users.get_user_by_id(p.user_id)  # ← async in this PR
-                prompts.append(
-                    PromptUserResponse.model_validate(
-                        {
-                            **PromptModel.model_validate(p).model_dump(),
-                            "user": user.model_dump() if user else None,
-                        }
-                    )
-                )
-            return prompts
+    async def get_tags_by_ids_and_user_id(
+        self, ids: list[str], user_id: str
+    ) -> list[TagModel]:
+        async with get_db() as db:
+            res = await db.execute(
+                select(Tag).where(Tag.id.in_(ids), Tag.user_id == user_id)
+            )
+            rows = res.scalars().all()
+            return [TagModel.model_validate(t) for t in rows]
 
-    async def get_prompts_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[PromptUserResponse]:
-        prompts = await self.get_prompts()
-        return [
-            prompt
-            for prompt in prompts
-            if prompt.user_id == user_id
-            or has_access(user_id, permission, prompt.access_control)
-        ]
-
-    async def update_prompt_by_command(
-        self, command: str, form_data: PromptForm
-    ) -> Optional[PromptModel]:
+    async def delete_tag_by_name_and_user_id(self, name: str, user_id: str) -> bool:
         try:
             async with get_db() as db:
-                res = await db.execute(select(Prompt).filter_by(command=command))
-                row = res.scalars().first()
-                if not row:
-                    return None
-                row.title = form_data.title
-                row.content = form_data.content
-                row.access_control = form_data.access_control
-                row.timestamp = int(time.time())
-                await db.commit()
-                await db.refresh(row)
-                return PromptModel.model_validate(row)
-        except Exception:
-            return None
-
-    async def delete_prompt_by_command(self, command: str) -> bool:
-        try:
-            async with get_db() as db:
-                await db.execute(delete(Prompt).where(Prompt.command == command))
+                id = name.replace(" ", "_").lower()
+                await db.execute(delete(Tag).where(Tag.id == id, Tag.user_id == user_id))
                 await db.commit()
                 return True
-        except Exception:
+        except Exception as e:
+            log.error(f"delete_tag: {e}")
             return False
 
 
-Prompts = PromptsTable()
+Tags = TagTable()
