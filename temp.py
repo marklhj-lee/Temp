@@ -1,27 +1,19 @@
-import asyncio
-CONFIG_DATA: dict = asyncio.run(get_config())
+from open_webui.internal.config import initialize_config_from_disk_then_db
+    from open_webui.env import DATA_DIR
+    await initialize_config_from_disk_then_db(DATA_DIR)
 
-async def save_to_db(data: dict) -> None:
-    async with get_db() as db:
-        res = await db.execute(select(Config).limit(1))
-        existing_config = res.scalars().first()
-        if not existing_config:
-            db.add(Config(data=data, version=0))
-        else:
-            existing_config.data = data
-            existing_config.updated_at = datetime.now()
-            db.add(existing_config)
-        await db.commit()
+async def initialize_config_from_disk_then_db(DATA_DIR: Path) -> None:
+    """
+    1) If DATA_DIR/config.json exists, migrate it into DB and rename to old_config.json
+    2) Load CONFIG_DATA from DB into memory
+    """
+    global CONFIG_DATA
 
+    cfg_path = DATA_DIR / "config.json"
+    if cfg_path.exists():
+        with open(cfg_path, "r") as f:
+            data = json.load(f)
+        await save_to_db(data)
+        cfg_path.rename(DATA_DIR / "old_config.json")
 
-async def reset_config() -> None:
-    async with get_db() as db:
-        await db.execute(delete(Config))
-        await db.commit()
-
-
-async def get_config() -> dict:
-    async with get_db() as db:
-        res = await db.execute(select(Config).order_by(Config.id.desc()).limit(1))
-        config_entry = res.scalars().first()
-        return config_entry.data if config_entry else DEFAULT_CONFIG
+    CONFIG_DATA = await get_config()
