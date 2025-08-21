@@ -2,16 +2,15 @@ import logging
 import time
 from typing import Optional
 
-from open_webui.internal.db import Base, JSONField  # keep Base/JSONField
-from open_webui.internal.db_async import get_db     # <-- use your async session getter
+from open_webui.internal.db import Base, JSONField
+from open_webui.internal.db_async import get_db  # ← async session
 from open_webui.env import SRC_LOG_LEVELS
 
-from open_webui.models.users import Users, UserResponse
+from open_webui.models.users import Users, UserResponse  # ← assume async Users.get_user_by_id
 
 from pydantic import BaseModel, ConfigDict
 
 from sqlalchemy import BigInteger, Column, Text, JSON, Boolean, select, delete
-from sqlalchemy import and_
 
 from open_webui.utils.access_control import has_access
 
@@ -43,6 +42,9 @@ class Model(Base):
     __tablename__ = "model"
 
     id = Column(Text, primary_key=True)
+    """
+        The model's id as used in the API. If set to an existing model, it will override the model.
+    """
     user_id = Column(Text)
 
     base_model_id = Column(Text, nullable=True)
@@ -77,10 +79,13 @@ class ModelModel(BaseModel):
     id: str
     user_id: str
     base_model_id: Optional[str] = None
+
     name: str
     params: ModelParams
     meta: ModelMeta
+
     access_control: Optional[dict] = None
+
     is_active: bool
     updated_at: int  # timestamp in epoch
     created_at: int  # timestamp in epoch
@@ -140,23 +145,22 @@ class ModelsTable:
 
     async def get_models(self) -> list[ModelUserResponse]:
         async with get_db() as db:
-            # base_model_id != None -> use .is_not(None) in SQLAlchemy
             res = await db.execute(select(Model).where(Model.base_model_id.is_not(None)))
             rows = res.scalars().all()
 
-        models: list[ModelUserResponse] = []
-        for m in rows:
-            # If Users.get_user_by_id has an async version, switch to: user = await Users.get_user_by_id(m.user_id)
-            user = Users.get_user_by_id(m.user_id)
-            models.append(
-                ModelUserResponse.model_validate(
-                    {
-                        **ModelModel.model_validate(m).model_dump(),
-                        "user": user.model_dump() if user else None,
-                    }
+            models: list[ModelUserResponse] = []
+            for m in rows:
+                # async user lookup (same place in flow as before, but now awaited)
+                user = await Users.get_user_by_id(m.user_id)
+                models.append(
+                    ModelUserResponse.model_validate(
+                        {
+                            **ModelModel.model_validate(m).model_dump(),
+                            "user": user.model_dump() if user else None,
+                        }
+                    )
                 )
-            )
-        return models
+            return models
 
     async def get_base_models(self) -> list[ModelModel]:
         async with get_db() as db:
@@ -166,6 +170,7 @@ class ModelsTable:
     async def get_models_by_user_id(
         self, user_id: str, permission: str = "write"
     ) -> list[ModelUserResponse]:
+        # keep call shape; now awaits the async version above
         models = await self.get_models()
         return [
             model
@@ -203,7 +208,6 @@ class ModelsTable:
                 if not row:
                     return None
 
-                # update only fields present in form (excluding id)
                 data = model.model_dump(exclude={"id"})
                 for k, v in data.items():
                     setattr(row, k, v)
