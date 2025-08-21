@@ -155,16 +155,71 @@ class UsersTable:
             return None
 
     async def get_users(
-        self, skip: Optional[int] = None, limit: Optional[int] = None
-    ) -> list[UserModel]:
+        self,
+        filter: Optional[dict] = None,
+        skip: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
         async with get_db() as db:
-            query = select(User).order_by(User.created_at.desc())
+            query = select(User)
+
+            if filter:
+                query_key = filter.get("query")
+                if query_key:
+                    query = query.where(
+                        or_(
+                            User.name.ilike(f"%{query_key}%"),
+                            User.email.ilike(f"%{query_key}%"),
+                        )
+                    )
+
+                order_by = filter.get("order_by")
+                direction = filter.get("direction")
+
+                if order_by == "name":
+                    query = query.order_by(
+                        User.name.asc() if direction == "asc" else User.name.desc()
+                    )
+                elif order_by == "email":
+                    query = query.order_by(
+                        User.email.asc() if direction == "asc" else User.email.desc()
+                    )
+                elif order_by == "created_at":
+                    query = query.order_by(
+                        User.created_at.asc() if direction == "asc" else User.created_at.desc()
+                    )
+                elif order_by == "last_active_at":
+                    query = query.order_by(
+                        User.last_active_at.asc() if direction == "asc" else User.last_active_at.desc()
+                    )
+                elif order_by == "updated_at":
+                    query = query.order_by(
+                        User.updated_at.asc() if direction == "asc" else User.updated_at.desc()
+                    )
+                elif order_by == "role":
+                    query = query.order_by(
+                        User.role.asc() if direction == "asc" else User.role.desc()
+                    )
+            else:
+                query = query.order_by(User.created_at.desc())
+
             if skip:
                 query = query.offset(skip)
             if limit:
                 query = query.limit(limit)
+
+            # fetch users
             res = await db.execute(query)
-            return [UserModel.model_validate(u) for u in res.scalars().all()]
+            users = res.scalars().all()
+
+            # fetch total count
+            total_res = await db.execute(select(func.count()).select_from(User))
+            total = total_res.scalar()
+
+            return {
+                "users": [UserModel.model_validate(user) for user in users],
+                "total": total,
+            }
 
     async def get_users_by_user_ids(self, user_ids: list[str]) -> list[UserModel]:
         async with get_db() as db:
