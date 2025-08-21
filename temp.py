@@ -1,244 +1,325 @@
-import logging
 import time
 from typing import Optional
 
 from open_webui.internal.db import Base, JSONField
-from open_webui.internal.db_async import get_db
-from open_webui.models.users import Users, UserResponse
-from open_webui.env import SRC_LOG_LEVELS
+from open_webui.internal.db_async import get_db  # ← async session
+
+from open_webui.models.chats import Chats
+from open_webui.models.groups import Groups
+
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON, select, delete
-
-from open_webui.utils.access_control import has_access
-
-log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["MODELS"])
+from sqlalchemy import BigInteger, Column, String, Text, select, delete
 
 
 ####################
-# Tools DB Schema
+# User DB Schema (unchanged)
 ####################
-class Tool(Base):
-    __tablename__ = "tool"
+
+class User(Base):
+    __tablename__ = "user"
 
     id = Column(String, primary_key=True)
-    user_id = Column(String)
-    name = Column(Text)
-    content = Column(Text)
-    specs = Column(JSONField)
-    meta = Column(JSONField)
-    valves = Column(JSONField)
+    name = Column(String)
+    email = Column(String)
+    role = Column(String)
+    profile_image_url = Column(Text)
 
-    access_control = Column(JSON, nullable=True)  # Controls data access levels.
-
+    last_active_at = Column(BigInteger)
     updated_at = Column(BigInteger)
     created_at = Column(BigInteger)
 
+    api_key = Column(String, nullable=True, unique=True)
+    settings = Column(JSONField, nullable=True)
+    info = Column(JSONField, nullable=True)
 
-class ToolMeta(BaseModel):
-    description: Optional[str] = None
-    manifest: Optional[dict] = {}
+    oauth_sub = Column(Text, unique=True)
 
 
-class ToolModel(BaseModel):
+class UserSettings(BaseModel):
+    ui: Optional[dict] = {}
+    model_config = ConfigDict(extra="allow")
+    pass
+
+
+class UserModel(BaseModel):
     id: str
-    user_id: str
     name: str
-    content: str
-    specs: list[dict]
-    meta: ToolMeta
-    access_control: Optional[dict] = None
+    email: str
+    role: str = "pending"
+    profile_image_url: str
 
-    updated_at: int  # timestamp in epoch
-    created_at: int  # timestamp in epoch
+    last_active_at: int  # timestamp in epoch
+    updated_at: int
+    created_at: int
+
+    api_key: Optional[str] = None
+    settings: Optional[UserSettings] = None
+    info: Optional[dict] = None
+    oauth_sub: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 ####################
-# Forms
+# Forms (unchanged)
 ####################
-class ToolUserModel(ToolModel):
-    user: Optional[UserResponse] = None
 
-
-class ToolResponse(BaseModel):
-    id: str
-    user_id: str
-    name: str
-    meta: ToolMeta
-    access_control: Optional[dict] = None
-    updated_at: int  # timestamp in epoch
-    created_at: int  # timestamp in epoch
-
-
-class ToolUserResponse(ToolResponse):
-    user: Optional[UserResponse] = None
-
-
-class ToolForm(BaseModel):
+class UserResponse(BaseModel):
     id: str
     name: str
-    content: str
-    meta: ToolMeta
-    access_control: Optional[dict] = None
+    email: str
+    role: str
+    profile_image_url: str
 
 
-class ToolValves(BaseModel):
-    valves: Optional[dict] = None
+class UserNameResponse(BaseModel):
+    id: str
+    name: str
+    role: str
+    profile_image_url: str
 
 
-class ToolsTable:
-    async def insert_new_tool(
-        self, user_id: str, form_data: ToolForm, specs: list[dict]
-    ) -> Optional[ToolModel]:
+class UserRoleUpdateForm(BaseModel):
+    id: str
+    role: str
+
+
+class UserUpdateForm(BaseModel):
+    name: str
+    email: str
+    profile_image_url: str
+    password: Optional[str] = None
+
+
+class UsersTable:
+    async def insert_new_user(
+        self,
+        id: str,
+        name: str,
+        email: str,
+        profile_image_url: str = "/user.png",
+        role: str = "pending",
+        oauth_sub: Optional[str] = None,
+    ) -> Optional[UserModel]:
         async with get_db() as db:
-            tool = ToolModel(
-                **{
-                    **form_data.model_dump(),
-                    "specs": specs,
-                    "user_id": user_id,
-                    "updated_at": int(time.time()),
-                    "created_at": int(time.time()),
-                }
+            user = UserModel(
+                id=id,
+                name=name,
+                email=email,
+                role=role,
+                profile_image_url=profile_image_url,
+                last_active_at=int(time.time()),
+                created_at=int(time.time()),
+                updated_at=int(time.time()),
+                oauth_sub=oauth_sub,
             )
-            try:
-                row = Tool(**tool.model_dump())
-                db.add(row)
-                await db.commit()
-                await db.refresh(row)
-                return ToolModel.model_validate(row) if row else None
-            except Exception as e:
-                log.exception(f"Error creating a new tool: {e}")
-                return None
+            row = User(**user.model_dump())
+            db.add(row)
+            await db.commit()
+            await db.refresh(row)
+            return user if row else None
 
-    async def get_tool_by_id(self, id: str) -> Optional[ToolModel]:
+    async def get_user_by_id(self, id: str) -> Optional[UserModel]:
         try:
             async with get_db() as db:
-                row = await db.get(Tool, id)
-                return ToolModel.model_validate(row) if row else None
+                row = await db.get(User, id)
+                return UserModel.model_validate(row) if row else None
         except Exception:
             return None
 
-    async def get_tools(self) -> list[ToolUserModel]:
-        async with get_db() as db:
-            res = await db.execute(select(Tool).order_by(Tool.updated_at.desc()))
-            rows = res.scalars().all()
-
-            tools: list[ToolUserModel] = []
-            for t in rows:
-                user = await Users.get_user_by_id(t.user_id)  # async in this PR
-                tools.append(
-                    ToolUserModel.model_validate(
-                        {
-                            **ToolModel.model_validate(t).model_dump(),
-                            "user": user.model_dump() if user else None,
-                        }
-                    )
-                )
-            return tools
-
-    async def get_tools_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[ToolUserModel]:
-        tools = await self.get_tools()
-        return [
-            tool
-            for tool in tools
-            if tool.user_id == user_id
-            or has_access(user_id, permission, tool.access_control)
-        ]
-
-    async def get_tool_valves_by_id(self, id: str) -> Optional[dict]:
+    async def get_user_by_api_key(self, api_key: str) -> Optional[UserModel]:
         try:
             async with get_db() as db:
-                row = await db.get(Tool, id)
-                return row.valves if row and row.valves else {}
-        except Exception as e:
-            log.exception(f"Error getting tool valves by id {id}: {e}")
+                res = await db.execute(select(User).filter_by(api_key=api_key))
+                row = res.scalars().first()
+                return UserModel.model_validate(row) if row else None
+        except Exception:
             return None
 
-    async def update_tool_valves_by_id(self, id: str, valves: dict) -> Optional[ToolValves]:
+    async def get_user_by_email(self, email: str) -> Optional[UserModel]:
         try:
             async with get_db() as db:
-                row = await db.get(Tool, id)
+                res = await db.execute(select(User).filter_by(email=email))
+                row = res.scalars().first()
+                return UserModel.model_validate(row) if row else None
+        except Exception:
+            return None
+
+    async def get_user_by_oauth_sub(self, sub: str) -> Optional[UserModel]:
+        try:
+            async with get_db() as db:
+                res = await db.execute(select(User).filter_by(oauth_sub=sub))
+                row = res.scalars().first()
+                return UserModel.model_validate(row) if row else None
+        except Exception:
+            return None
+
+    async def get_users(
+        self, skip: Optional[int] = None, limit: Optional[int] = None
+    ) -> list[UserModel]:
+        async with get_db() as db:
+            query = select(User).order_by(User.created_at.desc())
+            if skip:
+                query = query.offset(skip)
+            if limit:
+                query = query.limit(limit)
+            res = await db.execute(query)
+            return [UserModel.model_validate(u) for u in res.scalars().all()]
+
+    async def get_users_by_user_ids(self, user_ids: list[str]) -> list[UserModel]:
+        async with get_db() as db:
+            res = await db.execute(select(User).where(User.id.in_(user_ids)))
+            return [UserModel.model_validate(u) for u in res.scalars().all()]
+
+    async def get_num_users(self) -> Optional[int]:
+        async with get_db() as db:
+            res = await db.execute(select(User))
+            return len(res.scalars().all())
+
+    async def get_first_user(self) -> Optional[UserModel]:
+        try:
+            async with get_db() as db:
+                res = await db.execute(select(User).order_by(User.created_at))
+                row = res.scalars().first()
+                return UserModel.model_validate(row) if row else None
+        except Exception:
+            return None
+
+    async def get_user_webhook_url_by_id(self, id: str) -> Optional[str]:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
+                if not row or row.settings is None:
+                    return None
+                return row.settings.get("ui", {}).get("notifications", {}).get("webhook_url")
+        except Exception:
+            return None
+
+    async def update_user_role_by_id(self, id: str, role: str) -> Optional[UserModel]:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
                 if not row:
                     return None
-                row.valves = valves
-                row.updated_at = int(time.time())
+                row.role = role
                 await db.commit()
-                # original code returned get_tool_by_id(id); keep behavior minimal:
-                return await self.get_tool_by_id(id)
+                await db.refresh(row)
+                return UserModel.model_validate(row)
         except Exception:
             return None
 
-    async def get_user_valves_by_id_and_user_id(
-        self, id: str, user_id: str
-    ) -> Optional[dict]:
-        try:
-            user = await Users.get_user_by_id(user_id)
-            user_settings = user.settings.model_dump() if (user and user.settings) else {}
-
-            if "tools" not in user_settings:
-                user_settings["tools"] = {}
-            if "valves" not in user_settings["tools"]:
-                user_settings["tools"]["valves"] = {}
-
-            return user_settings["tools"]["valves"].get(id, {})
-        except Exception as e:
-            log.exception(
-                f"Error getting user values by id {id} and user_id {user_id}: {e}"
-            )
-            return None
-
-    async def update_user_valves_by_id_and_user_id(
-        self, id: str, user_id: str, valves: dict
-    ) -> Optional[dict]:
-        try:
-            user = await Users.get_user_by_id(user_id)
-            user_settings = user.settings.model_dump() if (user and user.settings) else {}
-
-            if "tools" not in user_settings:
-                user_settings["tools"] = {}
-            if "valves" not in user_settings["tools"]:
-                user_settings["tools"]["valves"] = {}
-
-            user_settings["tools"]["valves"][id] = valves
-
-            # Persist user settings
-            await Users.update_user_by_id(user_id, {"settings": user_settings})
-
-            return user_settings["tools"]["valves"][id]
-        except Exception as e:
-            log.exception(
-                f"Error updating user valves by id {id} and user_id {user_id}: {e}"
-            )
-            return None
-
-    async def update_tool_by_id(self, id: str, updated: dict) -> Optional[ToolModel]:
+    async def update_user_profile_image_url_by_id(
+        self, id: str, profile_image_url: str
+    ) -> Optional[UserModel]:
         try:
             async with get_db() as db:
-                row = await db.get(Tool, id)
+                row = await db.get(User, id)
+                if not row:
+                    return None
+                row.profile_image_url = profile_image_url
+                await db.commit()
+                await db.refresh(row)
+                return UserModel.model_validate(row)
+        except Exception:
+            return None
+
+    async def update_user_last_active_by_id(self, id: str) -> Optional[UserModel]:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
+                if not row:
+                    return None
+                row.last_active_at = int(time.time())
+                await db.commit()
+                await db.refresh(row)
+                return UserModel.model_validate(row)
+        except Exception:
+            return None
+
+    async def update_user_oauth_sub_by_id(
+        self, id: str, oauth_sub: str
+    ) -> Optional[UserModel]:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
+                if not row:
+                    return None
+                row.oauth_sub = oauth_sub
+                await db.commit()
+                await db.refresh(row)
+                return UserModel.model_validate(row)
+        except Exception:
+            return None
+
+    async def update_user_by_id(self, id: str, updated: dict) -> Optional[UserModel]:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
                 if not row:
                     return None
                 for k, v in updated.items():
                     setattr(row, k, v)
-                row.updated_at = int(time.time())
-
                 await db.commit()
                 await db.refresh(row)
-                return ToolModel.model_validate(row)
+                return UserModel.model_validate(row)
         except Exception:
             return None
 
-    async def delete_tool_by_id(self, id: str) -> bool:
+    async def update_user_settings_by_id(self, id: str, updated: dict) -> Optional[UserModel]:
         try:
             async with get_db() as db:
-                await db.execute(delete(Tool).where(Tool.id == id))
+                row = await db.get(User, id)
+                if not row:
+                    return None
+                settings = row.settings or {}
+                settings.update(updated)
+                row.settings = settings
+                await db.commit()
+                await db.refresh(row)
+                return UserModel.model_validate(row)
+        except Exception:
+            return None
+
+    async def delete_user_by_id(self, id: str) -> bool:
+        try:
+            # Remove User from Groups
+            await Groups.remove_user_from_all_groups(id)
+
+            # Delete User Chats
+            result = await Chats.delete_chats_by_user_id(id)
+            if result:
+                async with get_db() as db:
+                    await db.execute(delete(User).where(User.id == id))
+                    await db.commit()
+                return True
+            return False
+        except Exception:
+            return False
+
+    async def update_user_api_key_by_id(self, id: str, api_key: str) -> bool:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
+                if not row:
+                    return False
+                row.api_key = api_key
                 await db.commit()
                 return True
         except Exception:
             return False
 
+    async def get_user_api_key_by_id(self, id: str) -> Optional[str]:
+        try:
+            async with get_db() as db:
+                row = await db.get(User, id)
+                return row.api_key if row else None
+        except Exception:
+            return None
 
-Tools = ToolsTable()
+    async def get_valid_user_ids(self, user_ids: list[str]) -> list[str]:
+        async with get_db() as db:
+            res = await db.execute(select(User).where(User.id.in_(user_ids)))
+            return [u.id for u in res.scalars().all()]
+
+
+Users = UsersTable()
