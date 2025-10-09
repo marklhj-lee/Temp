@@ -1,24 +1,11 @@
-Time ─────────────────────────▶
-Req A: [work][DB wait.......][Redis wait.....][done]
-Req B:                               [work][DB wait.......][Redis wait.....][done]
-Req C:                                                           [work][DB wait.......][Redis wait.....][done]
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu ${VERSION_CODENAME:-$UBUNTU_CODENAME} stable" \
+| sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-
-Time ─────────────────────────▶
-Req A: [work][DB wait......][Redis wait.....][done]
-Req B:     [work][DB wait......][Redis wait.....][done]
-Req C:         [work][DB wait......][Redis wait.....][done]
-
-One request alone → async has a tiny bit more overhead than sync.
-
-Many concurrent requests → sync I/O blocks the event loop → everyone waits in line.
-
-Async I/O → while one request is waiting on the network (DB, Redis, HTTP), the event loop keeps serving other requests → much higher throughput under load.
-
-Blocking sync calls → one slow DB/HTTP call holds up the entire event loop.
-
-Async I/O → other requests keep moving while one request is waiting.
-
-Result: lower latency under load and higher max concurrency (measured in requests/sec per worker).
-
-Even though a single call may be ~1–2 ms slower, the system as a whole handles spikes much better.
+sudo apt-get update
+sudo apt-get install -y docker-compose-plugin
+docker compose version
