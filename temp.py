@@ -1,7 +1,5 @@
-# validate it’s a cert in PEM
-openssl x509 -in /tmp/cert02.pem -noout -subject -issuer -text | grep -A1 "Basic Constraints"
-
-# install it
-sudo install -d -m 0755 /usr/local/share/ca-certificates
-sudo cp /tmp/cert02.pem /usr/local/share/ca-certificates/corp-root.crt
-sudo update-ca-certificates    # should report "1 added"
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+python - <<PY
+import requests; print(requests.get("https://${HOST}/health", timeout=10).status_code)
+PY
