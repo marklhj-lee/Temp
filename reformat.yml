@@ -1,0 +1,45 @@
+# azure-pipelines.yml
+name: formatting-$(Date:yyyyMMdd)$(Rev:.r)
+
+pr:
+  branches:
+    include:
+      - '*'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  pythonVersion: '3.12'
+  maxLineLength: 180
+  pathsToCheck: 'app/**/*.py functions/**/*.py'
+
+stages:
+- stage: LintAndFormat
+  displayName: Format & Lint (black + flake8)
+  jobs:
+  - job: checks
+    displayName: Run black & flake8
+    steps:
+    - checkout: self
+      clean: true
+      fetchDepth: 0
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install black flake8
+      displayName: Install tools
+
+    - script: |
+        echo "Running Black (line length $(maxLineLength))"
+        black --check --diff --line-length $(maxLineLength) $(pathsToCheck)
+      displayName: Black (check only)
+
+    - script: |
+        echo "Running flake8 (max line length $(maxLineLength))"
+        flake8 $(pathsToCheck) --max-line-length=$(maxLineLength) --extend-ignore=E203,W503
+      displayName: flake8
