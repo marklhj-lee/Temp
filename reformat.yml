@@ -1,4 +1,3 @@
-# azure-pipelines.yml
 name: formatting-$(Date:yyyyMMdd)$(Rev:.r)
 
 pr:
@@ -11,8 +10,7 @@ pool:
 
 variables:
   pythonVersion: '3.12'
-  maxLineLength: 180
-  pathsToCheck: 'app/**/*.py functions/**/*.py'
+  pathsToCheck: 'app functions'
 
 stages:
 - stage: LintAndFormat
@@ -35,11 +33,11 @@ stages:
       displayName: Install tools
 
     - script: |
-        echo "Running Black (line length $(maxLineLength))"
-        black --check --diff --line-length $(maxLineLength) $(pathsToCheck)
+        echo "Running Black (check only; config from pyproject.toml)"
+        black --check --diff $(pathsToCheck)
       displayName: Black (check only)
 
     - script: |
-        echo "Running flake8 (max line length $(maxLineLength))"
-        flake8 $(pathsToCheck) --max-line-length=$(maxLineLength) --extend-ignore=E203,W503
+        echo "Running Flake8 (config from .flake8)"
+        flake8 $(pathsToCheck)
       displayName: flake8

@@ -1,0 +1,15 @@
+line-length = 180
+target-version = ['py312']
+exclude = '''
+(
+  /(
+      \.venv
+    | venv
+    | build
+    | dist
+    | node_modules
+    | __pycache__
+    | migrations
+  )/
+)
+'''
