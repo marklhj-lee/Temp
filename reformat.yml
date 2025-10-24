@@ -14,10 +14,10 @@ variables:
 
 stages:
 - stage: LintAndFormat
-  displayName: Format & Lint (black + flake8)
+  displayName: Format & Lint (backend + frontend)
   jobs:
-  - job: checks
-    displayName: Run black & flake8
+  - job: BackendChecks
+    displayName: Run Black & Flake8
     steps:
     - checkout: self
       clean: true
@@ -30,7 +30,7 @@ stages:
     - script: |
         python -m pip install --upgrade pip
         pip install black flake8
-      displayName: Install tools
+      displayName: Install Python tools
 
     - script: |
         echo "Running Black (check only; config from pyproject.toml)"
@@ -41,3 +41,34 @@ stages:
         echo "Running Flake8 (config from .flake8)"
         flake8 $(pathsToCheck)
       displayName: flake8
+
+  - job: FrontendChecks
+    displayName: Run ESLint & Prettier
+    steps:
+    - checkout: self
+      clean: true
+      fetchDepth: 0
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: Use Node.js 20
+
+    - script: |
+        cd app/frontend
+        echo "Installing Node dependencies..."
+        npm ci
+      displayName: Install Node dependencies
+      workingDirectory: app/frontend
+
+    - script: |
+        echo "Running ESLint..."
+        npm run lint
+      displayName: ESLint
+      workingDirectory: app/frontend
+
+    - script: |
+        echo "Running Prettier check..."
+        npm run format
+      displayName: Prettier
+      workingDirectory: app/frontend
